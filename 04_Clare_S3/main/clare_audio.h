@@ -101,6 +101,8 @@ void clare_audio_alc_deinit(void);
 esp_err_t clare_audio_mp3_start(void);
 esp_err_t clare_audio_mp3_write(const uint8_t *data, size_t len, bool end_of_stream);
 esp_err_t clare_audio_mp3_end(void);
+/** Cancel queued audio; the playback task closes its own decoder. */
+esp_err_t clare_audio_mp3_abort(void);
 esp_err_t clare_audio_play_mp3(const uint8_t *data, size_t len);
 
 /**
@@ -125,3 +127,12 @@ static inline esp_err_t clare_audio_player_write_pcm(const int16_t *pcm, int fra
 }
 #endif
 
+
+// Signal EOS without waiting for playback; the decoder task drains and closes itself.
+#ifdef __cplusplus
+extern "C" {
+#endif
+esp_err_t clare_audio_mp3_finish_async(void);
+#ifdef __cplusplus
+}
+#endif

@@ -638,7 +638,10 @@ static void dispatch_ws_json(WsContext *ctx, const char *payload, size_t payload
             emit_event(CLARE_NET_EVENT_TRANSCRIPT, text, nullptr, 0, is_final);
         }
     } else if (ctx->kind == WsKind::Host) {
-        if (strcmp(type, "transcription") == 0 || strcmp(type, "transcript") == 0) {
+        if (strcmp(type, "question_partial") == 0) {
+            const char *text = json_text_field(root);
+            if (*text) emit_event(CLARE_NET_EVENT_HOST_QUESTION_PARTIAL, text);
+        } else if (strcmp(type, "transcription") == 0 || strcmp(type, "transcript") == 0) {
             static const char *const host_final_names[] = {"is_final", "final"};
             ESP_LOGI(TAG, "host transcription peek=%.60s", json_text_field(root));
             emit_event(CLARE_NET_EVENT_HOST_TRANSCRIPTION, json_text_field(root), nullptr, 0,
@@ -1521,8 +1524,9 @@ extern "C" esp_err_t clare_net_create_session(const char *topic,
     return ESP_OK;
 }
 
-extern "C" esp_err_t clare_net_end_session(const char *session_id)
+extern "C" esp_err_t clare_net_finalize_session(const char *session_id, bool *complete)
 {
+    if (complete) *complete = false;
     const char *id = session_id;
     if (!id || !id[0]) {
         id = s_session_id;
@@ -1539,16 +1543,35 @@ extern "C" esp_err_t clare_net_end_session(const char *session_id)
     if (!make_http_url(url, sizeof(url), path)) {
         return ESP_ERR_INVALID_ARG;
     }
-    char response[END_RESPONSE_MAX] = {};
+    char *response = static_cast<char *>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM));
+    if (!response) return ESP_ERR_NO_MEM;
     int status = 0;
+    bool truncated = false;
     esp_err_t err = http_perform(url, HTTP_METHOD_POST, nullptr, nullptr,
-                                 response, sizeof(response), &status, nullptr);
+                                 response, 4096, &status, &truncated);
+    cJSON *reply = err == ESP_OK && !truncated ? cJSON_Parse(response) : nullptr;
+    heap_caps_free(response);
+    if (complete && reply) {
+        const cJSON *backlog = cJSON_GetObjectItemCaseSensitive(reply, "audioBacklog");
+        const cJSON *dropped = cJSON_GetObjectItemCaseSensitive(backlog, "dropped_frames");
+        *complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply,"analysis_final")) &&
+                    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply,"sourceComplete")) &&
+                    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply,"analysisComplete")) &&
+                    cJSON_IsNumber(dropped) && dropped->valueint == 0;
+    }
+    if (err == ESP_OK && !reply) err = ESP_ERR_INVALID_RESPONSE;
+    cJSON_Delete(reply);
     if (err != ESP_OK) {
         report_error(err, status);
         return err;
     }
     emit_event(CLARE_NET_EVENT_SESSION_ENDED, nullptr, nullptr, 0, false, status);
     return ESP_OK;
+}
+
+extern "C" esp_err_t clare_net_end_session(const char *session_id)
+{
+    return clare_net_finalize_session(session_id, nullptr);
 }
 
 extern "C" esp_err_t clare_net_get_understanding(const char *session_id,

@@ -11,6 +11,7 @@ typedef enum {
     CLARE_UI_CLARE,
     CLARE_UI_DEMO,
     CLARE_UI_WIFI_SETUP,
+    CLARE_UI_ASK,
 } clare_ui_page_t;
 
 typedef struct {
@@ -22,6 +23,9 @@ typedef struct {
     void (*refresh_summary)(void *ctx);
     void (*open_wifi_setup)(void *ctx);
     void (*close_wifi_setup)(void *ctx);
+    void (*resume_meeting)(void *ctx);
+    void (*end_meeting)(void *ctx);
+    void (*stop_answer)(void *ctx);
     void *ctx;
 } clare_ui_callbacks_t;
 
@@ -41,6 +45,21 @@ void clare_ui_set_host_active(bool active);
 void clare_ui_set_prov_ssid(const char *text);
 void clare_ui_set_prov_status(const char *text);
 
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void clare_ui_set_host_busy(bool busy);
+void clare_ui_set_conversation_active(bool active);
+void clare_ui_set_action_busy(bool busy);
+void clare_ui_set_session_ended(bool ended);
+void clare_ui_new_meeting(void);
+void clare_ui_set_session_available(bool available);
+bool clare_ui_set_understanding(const char *json);
+void clare_ui_summary_error(const char *text);
 #ifdef __cplusplus
 }
 #endif

@@ -750,6 +750,7 @@ static esp_err_t tts_decoder_reopen()
 constexpr size_t kKeepAliveFrames = 320;  // 20 ms at 16 kHz
 static const int16_t kKeepAliveSilence[kKeepAliveFrames] = {};
 static volatile bool s_pcm_streaming = false;
+static volatile bool s_tts_abort = false;
 
 static void tts_play_task(void *)
 {
@@ -782,6 +783,7 @@ static void tts_play_task(void *)
     // safely park and the TX path never returns to idle mid-handover.
     s_pcm_streaming = true;
     while (stream_open) {
+        if (s_tts_abort) break;
         lock(s_tts.lock);
         const bool eos = s_tts.eos;
         size_t got = tts_ring_read(feed + pending, 1024 - pending);
@@ -965,6 +967,9 @@ static void tts_keepalive_stop(void)
 extern "C" esp_err_t clare_audio_mp3_start(void)
 {
 #if CLARE_AUDIO_HAS_MP3
+    s_tts_abort = false;
+#endif
+#if CLARE_AUDIO_HAS_MP3
     if (!clare_audio_is_ready()) return ESP_ERR_INVALID_STATE;
     if (s_audio.mp3_active) {
         // Stream already open (another answer_audio message, or a new answer
@@ -1033,6 +1038,35 @@ extern "C" esp_err_t clare_audio_mp3_write(const uint8_t *data, size_t len, bool
     (void)data;
     (void)len;
     (void)end_of_stream;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+extern "C" esp_err_t clare_audio_mp3_abort(void)
+{
+#if CLARE_AUDIO_HAS_MP3
+    if (!s_tts.lock) return ESP_OK;
+    s_tts_abort = true;
+    lock(s_tts.lock);
+    s_tts.rpos = s_tts.wpos;
+    s_tts.eos = true;
+    unlock(s_tts.lock);
+    for (int i = 0; i < 100 && s_tts.task; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    return s_tts.task ? ESP_ERR_TIMEOUT : ESP_OK;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+extern "C" esp_err_t clare_audio_mp3_finish_async(void)
+{
+#if CLARE_AUDIO_HAS_MP3
+    if (!s_tts.lock) return ESP_OK;
+    lock(s_tts.lock);
+    s_tts.eos = true;
+    unlock(s_tts.lock);
+    return ESP_OK;
+#else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }

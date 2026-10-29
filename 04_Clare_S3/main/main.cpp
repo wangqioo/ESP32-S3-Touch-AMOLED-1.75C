@@ -1,3 +1,4 @@
+#include "clare_vad.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -9,6 +10,8 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
+#include <atomic>
 #include "nvs_flash.h"
 #include <arpa/inet.h>
 #include "esp_codec_dev.h"
@@ -47,6 +50,13 @@ static volatile bool s_meeting_active = false;
 static volatile bool s_transcribe_connected = false;
 static volatile bool s_host_connected = false;
 static volatile bool s_host_recording = false;
+static std::atomic<bool> s_conversation_active{false}, s_conversation_stop_requested{false};
+static std::atomic<bool> s_auto_send_pending{false}, s_round_inflight{false}, s_completion_queued{false};
+static std::atomic<uint32_t> s_listen_epoch{0};
+// These are owned by the action task; callbacks only enqueue transitions.
+static bool s_waiting_playback = false;
+static TickType_t s_echo_settle_since = 0, s_next_host_connect = 0;
+static unsigned s_host_reconnect_attempts = 0;
 // Set by the HOST_SESSION_REJECTED event (HTTP 403 on the host handshake):
 // distinguishes a genuinely invalid session from a transient connect failure,
 // so the Ask retry logic only discards the meeting session when it must.
@@ -61,7 +71,12 @@ enum class Action : uint8_t {
     HandleMeetingDisconnect,
     HandleHostRejected,
     ToggleHost,
+    AutoSendHost,
+    SpeechStarted,
     RefreshSummary,
+    ResumeMeeting,
+    EndMeeting,
+    StopAnswer,
     FinishHost,
     CleanupHost,
     StartProvisioning,
@@ -81,6 +96,10 @@ static int16_t s_audio_stereo[kAudioFrameSamples * 2] = {};
 static int16_t s_audio_mono[kAudioFrameSamples] = {};
 
 static void enqueue_action(Action action);
+static bool s_session_ended = false;
+static volatile bool s_host_cancelled = false;
+static volatile bool s_host_failed = false;
+static std::atomic<bool> s_refresh_queued{false};
 
 // If the server never answers (e.g. Send tapped with no speech recorded),
 // finish the Q&A automatically after 60 s so the Ask button can never wedge.
@@ -88,11 +107,13 @@ static void host_answer_timeout(void *)
 {
     if (s_host_answer_since != 0) {
         ESP_LOGW(TAG, "Answer watchdog: no done in 60 s, auto-finishing Q&A");
-        enqueue_action(Action::FinishHost);
+        s_host_failed = true;
+        clare_ui_set_answer("等待回答超时，请检查网络后重新提问。");
+        if (!s_completion_queued.exchange(true)) enqueue_action(Action::FinishHost);
     }
 }
 
-static char s_host_answer_text[2048] = {};
+static EXT_RAM_BSS_ATTR char s_host_answer_text[12288] = {};
 
 static void ui_status(const char *text) { clare_ui_set_status(text); ESP_LOGI(TAG, "%s", text); }
 
@@ -117,8 +138,7 @@ static void host_answer_feed(const char *chunk)
     } else if (cur + clen < sizeof(s_host_answer_text)) {
         memcpy(s_host_answer_text + cur, chunk, clen + 1);
     } else {
-        strlcpy(s_host_answer_text, chunk, sizeof(s_host_answer_text));
-        action = "overflow-replace";
+        action = "display-limit";
     }
     ESP_LOGI(TAG, "Answer text feed %s cur=%u chunk=%u peek=%.48s", action,
              static_cast<unsigned>(cur), static_cast<unsigned>(clen), chunk);
@@ -135,36 +155,45 @@ static void net_event(const clare_net_event_t *event, void *)
     case CLARE_NET_EVENT_WIFI_FAILED: clare_ui_set_wifi("Wi-Fi: failed"); break;
     case CLARE_NET_EVENT_TRANSCRIBE_CONNECTED:
         s_transcribe_connected = true;
-        if (s_meeting_active) ui_status("Listening - live transcription");
+        if (s_meeting_active) ui_status("正在记录 / 实时转写");
         break;
     case CLARE_NET_EVENT_TRANSCRIBE_DISCONNECTED:
         s_transcribe_connected = false;
         if (s_meeting_active) enqueue_action(Action::HandleMeetingDisconnect);
         break;
     case CLARE_NET_EVENT_TRANSCRIPT: if (event->text) clare_ui_append_transcript(event->text, event->is_final); break;
-    case CLARE_NET_EVENT_HOST_CONNECTED: s_host_connected = true; ui_status("Ask Clare a question"); break;
+    case CLARE_NET_EVENT_HOST_CONNECTED: s_host_connected = true; break;
     case CLARE_NET_EVENT_HOST_DISCONNECTED:
         s_host_connected = false; s_host_recording = false; clare_ui_set_host_active(false);
         s_host_answer_since = 0;
         // The failed/closed client must be torn down (in the main task, not
         // here in the ws task): a stale ctx->client makes every later
         // clare_net_host_connect() fail with INVALID_STATE, which surfaced
-        // as "Clare Q&A unavailable" until reboot.
+        // as "问答暂不可用，请重试" until reboot.
         enqueue_action(Action::CleanupHost);
+        break;
+    case CLARE_NET_EVENT_HOST_QUESTION_PARTIAL:
+        // Preview is a cumulative snapshot, not an answer or an instruction to
+        // stop recording. Ignore delayed previews once Send/Cancel was pressed.
+        if (s_host_recording && !s_host_cancelled && event->text && *event->text) {
+            snprintf(s_host_answer_text, sizeof(s_host_answer_text), "你：%s", event->text);
+            clare_ui_set_answer(s_host_answer_text);
+            ui_status("正在听 / 停顿后自动发送");
+        }
         break;
     case CLARE_NET_EVENT_HOST_TRANSCRIPTION:
         if (event->text) {
-            snprintf(s_host_answer_text, sizeof(s_host_answer_text), "You: %s\nClare: ", event->text);
+            snprintf(s_host_answer_text, sizeof(s_host_answer_text), "你：%s\n\nClare：", event->text);
             clare_ui_set_answer(s_host_answer_text);
-            ui_status("Question received");
+            ui_status("问题已识别，正在思考");
         }
         break;
     case CLARE_NET_EVENT_HOST_ANSWER_TEXT:
-        host_answer_feed(event->text);
+        if (!s_host_cancelled) host_answer_feed(event->text);
         break;
-    case CLARE_NET_EVENT_HOST_TTS_START: (void)clare_audio_mp3_start(); break;
+    case CLARE_NET_EVENT_HOST_TTS_START: if (!s_host_cancelled) (void)clare_audio_mp3_start(); break;
     case CLARE_NET_EVENT_HOST_ANSWER_AUDIO:
-        if (event->binary && event->binary_len) {
+        if (!s_host_cancelled && event->binary && event->binary_len) {
             (void)clare_audio_mp3_write(event->binary, event->binary_len, false);
         }
         break;
@@ -176,26 +205,36 @@ static void net_event(const clare_net_event_t *event, void *)
         break;
     case CLARE_NET_EVENT_HOST_SESSION_REJECTED:
         s_host_session_rejected = true;
-        ui_status("Session expired - recreating");
+        ui_status("会话已过期，正在重新连接");
         enqueue_action(Action::HandleHostRejected);
         break;
     case CLARE_NET_EVENT_HOST_DONE:
+        if (s_conversation_stop_requested) break;
+        if (s_conversation_active && (!s_round_inflight || s_completion_queued.exchange(true))) break;
+        if (!s_host_cancelled && !s_host_failed && !s_host_answer_text[0]) {
+            s_host_failed = true;
+            clare_ui_set_answer("没有听清这句话，请再说一次。");
+        }
         s_host_answer_since = 0;
         if (s_host_answer_timer) esp_timer_stop(s_host_answer_timer);
         enqueue_action(Action::FinishHost);
         break;
-    case CLARE_NET_EVENT_ERROR: ui_status("Network error - check Wi-Fi/API"); break;
+    case CLARE_NET_EVENT_ERROR:
+        if (s_host_recording || s_host_answer_since || s_host_connected) {
+            s_host_failed = true;
+            const bool auth = event->text && (strstr(event->text,"401") || strstr(event->text,"Unauthorized"));
+            clare_ui_set_answer(auth ? "服务器模型授权失败，请联系服务维护者。" : "这次回答未能完成，请检查网络后重新提问。");
+            ui_status(auth ? "模型服务授权失败" : "回答失败，请重试");
+        } else ui_status("连接暂时异常，请稍后重试");
+        break;
     case CLARE_NET_EVENT_PROV_STARTED:
         clare_ui_set_wifi("Wi-Fi: setup hotspot");
         clare_ui_set_page(CLARE_UI_WIFI_SETUP);
         clare_ui_set_prov_ssid(event->text ? event->text : "Clare-S3");
-        clare_ui_set_prov_status("Hotspot active. On your phone:\n"
-                                 "1. Join this hotspot (no password)\n"
-                                 "2. The setup page opens by itself");
+        clare_ui_set_prov_status("用手机连接上方热点，无需密码。\n连接后打开配网页面，选择你的 Wi-Fi。");
         break;
     case CLARE_NET_EVENT_PROV_CLIENT_CONNECTED:
-        clare_ui_set_prov_status("Phone connected.\n"
-                                 "Follow the popup to pick your Wi-Fi and type its password.");
+        clare_ui_set_prov_status("手机已连接。\n请在弹出的页面选择 Wi-Fi 并输入密码。");
         break;
     case CLARE_NET_EVENT_PROV_CREDENTIALS_SAVED: {
         // The password never crosses the event channel: reload the full
@@ -205,9 +244,9 @@ static void net_event(const clare_net_event_t *event, void *)
         if (clare_prov_credentials_load(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK) {
             (void)clare_net_wifi_set_credentials(ssid, pass);
             clare_ui_set_wifi("Wi-Fi: saved, reconnecting");
-            clare_ui_set_prov_status("Saved. Reconnecting to your Wi-Fi...");
+            clare_ui_set_prov_status("已保存，正在连接 Wi-Fi…");
         } else {
-            clare_ui_set_prov_status("Saved, but could not reload - restart the device.");
+            clare_ui_set_prov_status("配置读取失败，请重启设备。");
         }
         break;
     }
@@ -225,8 +264,14 @@ static void audio_task(void *)
     bool send_ok_logged = false;
     bool send_error_logged = false;
     uint32_t send_fail_streak = 0;
+    ClareVad vad;
+    uint32_t listen_epoch = 0;
     while (s_audio_task_run) {
-        if ((!s_meeting_active && !s_host_recording) || !s_codec) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        if (s_conversation_active && (s_conversation_stop_requested || s_auto_send_pending)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if ((!s_meeting_active && !s_host_recording && !s_conversation_active) || !s_codec) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         esp_codec_dev_handle_t mic = s_codec->Get_audio_codec_microphone();
         if (!mic) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         int ret = esp_codec_dev_read(mic, s_audio_stereo, sizeof(s_audio_stereo));
@@ -240,6 +285,12 @@ static void audio_task(void *)
         }
         for (size_t i = 0; i < kAudioFrameSamples; ++i) {
             s_audio_mono[i] = (int16_t)(((int32_t)s_audio_stereo[i * 2] + s_audio_stereo[i * 2 + 1]) / 2);
+        }
+        ClareVad::Event speech = ClareVad::Event::None;
+        if (s_conversation_active && s_host_recording && s_host_connected) {
+            const uint32_t epoch = s_listen_epoch.load();
+            if (epoch != listen_epoch) { vad.reset(); listen_epoch = epoch; }
+            speech = vad.process(s_audio_mono, kAudioFrameSamples);
         }
         (void)clare_audio_alc_process(s_audio_mono, kAudioFrameSamples);
         esp_err_t err = ESP_OK;
@@ -257,6 +308,17 @@ static void audio_task(void *)
             // (logs/clare_s3_round2_regression_20260829.log).
             if (!s_host_connected) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
             err = clare_net_host_send_audio(s_audio_mono, sizeof(s_audio_mono));
+            if (err == ESP_OK && s_conversation_active && !s_conversation_stop_requested) {
+                if (speech == ClareVad::Event::SpeechStarted) enqueue_action(Action::SpeechStarted);
+                if (speech == ClareVad::Event::EndOfSpeech && !s_auto_send_pending.exchange(true)) {
+                    Action send = Action::AutoSendHost;
+                    if (!s_action_queue || xQueueSend(s_action_queue, &send, 0) != pdTRUE) {
+                        s_auto_send_pending = false;
+                        vad.reset();
+                        ESP_LOGW(TAG, "Auto-send queue full; rearming speech detection");
+                    }
+                }
+            }
         } else if (s_meeting_active) {
             // Keep the meeting feed paused for the WHOLE Q&A — while the
             // answer is being generated (s_host_answer_since) and while the
@@ -272,7 +334,7 @@ static void audio_task(void *)
             // the server's done (logs/clare_s3_pit14_boot_20260831.log; the
             // client provably consumed every one of the 10029 MP3 bytes it
             // received, so the loss was upstream, not in the ring/decoder).
-            if (s_host_answer_since != 0 || clare_audio_mp3_is_active()) {
+            if (s_conversation_active || s_host_answer_since != 0 || clare_audio_mp3_is_active()) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
@@ -314,7 +376,7 @@ static void start_audio_task(void)
     BaseType_t result = xTaskCreate(audio_task, "clare_audio", 6144, nullptr, 5, &s_audio_task);
     if (result != pdPASS) {
         s_audio_task_run = false;
-        ui_status("Microphone unavailable");
+        ui_status("麦克风暂不可用");
     }
 }
 
@@ -326,13 +388,14 @@ static void stop_audio_task(void)
 
 static void start_meeting_impl(void *)
 {
-    if (s_meeting_active) return;
+    if (s_meeting_active) { stop_audio_task(); (void)clare_net_transcribe_flush(); s_meeting_active = false; }
     if (s_host_connected) {
         (void)clare_net_host_send_stop();
         (void)clare_net_host_disconnect();
         s_host_connected = false;
         s_host_recording = false;
     }
+    (void)clare_audio_mp3_abort();
     // The previous meeting's transcribe channel may have been kept open for
     // post-meeting Q&A (see stop_meeting_impl).  Tear it down before ending
     // the old session; otherwise ws_connect() would refuse the new meeting's
@@ -344,30 +407,32 @@ static void start_meeting_impl(void *)
         s_session_id[0] = 0;
     }
     if (!clare_net_wifi_is_connected()) {
-        ui_status("Connecting Wi-Fi...");
-        if (clare_net_wifi_connect(15000) != ESP_OK) { ui_status("Wi-Fi not ready"); return; }
+        ui_status("正在连接 Wi-Fi…");
+        if (clare_net_wifi_connect(15000) != ESP_OK) { ui_status("Wi-Fi 尚未连接"); return; }
     }
-    ui_status("Creating meeting session...");
-    if (clare_net_create_session(CONFIG_CLARE_TOPIC, s_session_id, sizeof(s_session_id)) != ESP_OK) { ui_status("Meeting service unavailable"); return; }
+    ui_status("正在创建会议…");
+    if (clare_net_create_session(CONFIG_CLARE_TOPIC, s_session_id, sizeof(s_session_id)) != ESP_OK) { ui_status("会议服务暂不可用"); return; }
+    s_session_ended = false;
     // Mark the user-requested meeting active before the WSS wait. This closes
     // the narrow race where a socket connects and drops before connect() has
     // returned; the disconnect handler can then reliably recover the UI.
     s_meeting_active = true;
     s_transcribe_connected = false;
     clare_ui_set_meeting_active(true);
-    ui_status("Connecting transcription...");
+    ui_status("正在连接转写服务…");
     if (clare_net_transcribe_connect(s_session_id) != ESP_OK) {
         s_meeting_active = false;
         clare_ui_set_meeting_active(false);
-        ui_status("Transcription connection failed");
+        ui_status("转写连接失败，请重试");
         clare_net_end_session(s_session_id);
         s_session_id[0] = 0;
         return;
     }
-    ui_status("Listening - live transcription");
+    ui_status("正在记录 / 实时转写");
+    clare_ui_new_meeting();
     clare_ui_reset_transcript();
     clare_ui_reset_answer();
-    clare_ui_set_transcript("Listening - live transcription will appear here.");
+
     start_audio_task();
 }
 
@@ -406,11 +471,12 @@ static void stop_meeting_impl(void *)
         s_host_recording = false;
     }
     clare_ui_set_host_active(false);
-    ui_status("Meeting ended - Ask Clare or refresh summary");
+    ui_status("录音已暂停 / 仍可提问和查看");
 }
 
 static void handle_meeting_disconnect_impl(void *)
 {
+    if (s_conversation_active) return; // Resume this channel when the conversation exits.
     if (!s_meeting_active) return;
     if (s_transcribe_connected) return;  // already recovered by a queued duplicate
     (void)clare_net_transcribe_disconnect();  // clean the dead handle
@@ -421,25 +487,25 @@ static void handle_meeting_disconnect_impl(void *)
     // backoff; recreate the session once if the id itself was rejected; only
     // give up after everything failed.
     for (int attempt = 1; attempt <= 3 && s_meeting_active && !s_transcribe_connected; ++attempt) {
-        ui_status("Reconnecting transcription...");
+        ui_status("正在恢复转写连接…");
         vTaskDelay(pdMS_TO_TICKS(1000 * attempt));
         if (clare_net_transcribe_connect(s_session_id) == ESP_OK) {
-            ui_status("Listening - live transcription");
+            ui_status("正在记录 / 实时转写");
             return;
         }
     }
     if (!s_meeting_active || s_transcribe_connected) return;
-    ui_status("Recreating meeting session...");
+    ui_status("正在重新创建会议…");
     if (clare_net_create_session(CONFIG_CLARE_TOPIC, s_session_id, sizeof(s_session_id)) == ESP_OK &&
         clare_net_transcribe_connect(s_session_id) == ESP_OK) {
-        ui_status("Listening - live transcription");
+        ui_status("正在记录 / 实时转写");
         return;
     }
     if (!s_meeting_active) return;
     s_meeting_active = false;
     if (!s_host_recording) stop_audio_task();
     clare_ui_set_meeting_active(false);
-    ui_status("Connection lost - tap Start to retry");
+    ui_status("连接已断开，请重新开始");
 }
 
 /*
@@ -449,6 +515,7 @@ static void handle_meeting_disconnect_impl(void *)
  */
 static void handle_host_rejected_impl(void *)
 {
+    if (s_conversation_active) return; // Never replace the meeting during a conversation.
     // toggle_host_impl retries inline on 403; if it already reconnected (or
     // is mid-handshake), this queued event is stale and must not tear the
     // fresh connection down.
@@ -461,16 +528,16 @@ static void handle_host_rejected_impl(void *)
     if (s_meeting_active) {
         // Never recreate the session from under a running meeting: the
         // transcribe supervisor owns the meeting-channel lifecycle.
-        ui_status("Ask failed - tap again to retry");
+        ui_status("提问失败，请重试");
         return;
     }
     if (s_session_id[0]) {
         (void)clare_net_end_session(s_session_id);
         s_session_id[0] = 0;
     }
-    ui_status("Reconnecting...");
+    ui_status("正在重新连接…");
     if (clare_net_create_session(CONFIG_CLARE_TOPIC, s_session_id, sizeof(s_session_id)) != ESP_OK) {
-        ui_status("Recreate failed - check network");
+        ui_status("会话创建失败，请检查网络");
         return;
     }
     // Pause the meeting feed before the handshake (same 403 reason as in
@@ -478,7 +545,7 @@ static void handle_host_rejected_impl(void *)
     s_host_recording = true;
     if (clare_net_host_connect(s_session_id) != ESP_OK) {
         s_host_recording = false;
-        ui_status("Reconnect failed - tap Ask Clare to retry");
+        ui_status("连接失败，请重新提问");
         return;
     }
     start_audio_task();
@@ -486,101 +553,133 @@ static void handle_host_rejected_impl(void *)
     // Status is set by the HOST_CONNECTED event during connect (no duplicate).
 }
 
-static void toggle_host_impl(void *)
+static void send_host_question()
 {
-    if (!s_session_id[0]) { ui_status("Start a meeting first"); return; }
-    if (s_host_recording) {
-        esp_err_t send_err = clare_net_host_send_end_of_speech();
-        s_host_recording = false;
-        if (!s_meeting_active) stop_audio_task();
-        clare_ui_set_host_active(false);
-        if (send_err != ESP_OK) {
-            ESP_LOGW(TAG, "Ask send failed err=%d", static_cast<int>(send_err));
-            ui_status("Ask send failed - tap Ask to retry");
-            return;
-        }
-        ui_status("Clare is answering...");
-        s_host_answer_since = xTaskGetTickCount();
-        if (s_host_answer_timer) {
-            esp_timer_stop(s_host_answer_timer);
-            esp_timer_start_once(s_host_answer_timer, 60 * 1000 * 1000);
-        }
-        return;
+    if (!s_conversation_active || s_conversation_stop_requested || !s_host_recording || !s_host_connected) return;
+    s_host_recording = false;
+    s_round_inflight = true;
+    s_completion_queued = false;
+    s_host_answer_since = xTaskGetTickCount();
+    clare_ui_set_host_active(false);
+    clare_ui_set_host_busy(true);
+    ui_status("正在思考，请稍候…");
+    if (s_host_answer_timer) {
+        esp_timer_stop(s_host_answer_timer);
+        esp_timer_start_once(s_host_answer_timer, 60 * 1000 * 1000);
     }
-    if (s_host_connected) {
-        // The previous question never finished (e.g. user tapped Send without
-        // speaking, so the server had no speech to answer and never sent
-        // done).  A tap after 30 s of waiting is an explicit abandon: tear
-        // the stale Q&A down and fall through to start a fresh one.
-        if (xTaskGetTickCount() - s_host_answer_since < pdMS_TO_TICKS(30000)) {
-            ui_status("Clare is still answering...");
-            return;
-        }
-        ESP_LOGW(TAG, "Abandoning stale Q&A (no answer for 30 s)");
+    ESP_LOGI(TAG, "Conversation: VAD end of speech, auto-send");
+    const esp_err_t err = clare_net_host_send_end_of_speech();
+    if (err != ESP_OK) {
+        s_round_inflight = false;
+        s_host_failed = true;
+        s_host_answer_since = 0;
+        if (s_host_answer_timer) esp_timer_stop(s_host_answer_timer);
         (void)clare_net_host_disconnect();
         s_host_connected = false;
-        s_host_answer_since = 0;  // the abandoned wait must not keep the meeting feed paused
-        if (s_host_answer_timer) esp_timer_stop(s_host_answer_timer);
-        clare_ui_set_host_active(false);
+        s_next_host_connect = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+        ui_status("问题未发出，正在重连，请稍后重说");
     }
-    clare_ui_reset_answer();
-    s_host_answer_text[0] = '\0';
-    ui_status("Connecting Clare...");  // instant tap feedback; the WS handshake below takes seconds
-    // Pause the meeting feed BEFORE the host WS handshake, not after: the
-    // backend rejects a second concurrent audio stream with a 403, and the
-    // handshake takes seconds during which the audio task is still running.
-    s_host_session_rejected = false;  // re-armed by HOST_SESSION_REJECTED during connect
+}
+
+static void begin_listening()
+{
+    if (!s_conversation_active || s_conversation_stop_requested || !s_host_connected) return;
+    s_host_cancelled = false;
+    s_host_failed = false;
+    s_host_answer_text[0] = 0;
+    s_host_answer_since = 0;
+    s_round_inflight = false;
+    s_completion_queued = false;
+    s_auto_send_pending = false;
+    s_listen_epoch.fetch_add(1);
     s_host_recording = true;
-    if (clare_net_host_connect(s_session_id) != ESP_OK) {
-        s_host_recording = false;
-        if (!s_host_session_rejected) {
-            // Transient failure (TLS/DNS/timeout, not a 403): the meeting
-            // session is still valid — retry the SAME session once instead
-            // of throwing away the meeting's transcript context by blindly
-            // recreating it.  (The old code recreated on ANY failure, which
-            // also silently split the context if an in-meeting Ask hit a
-            // transient connect error.)
-            ui_status("Reconnecting Clare...");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            s_host_session_rejected = false;
-            s_host_recording = true;
-            if (clare_net_host_connect(s_session_id) == ESP_OK) {
-                start_audio_task(); clare_ui_set_host_active(true);
-                return;
-            }
-            s_host_recording = false;
-            ui_status("Clare Q&A unavailable");
-            return;
-        }
-        // Genuine 403: the server expired the session (30 min idle reaper,
-        // HTTP /end at the next meeting start, or a server restart), so a
-        // late post-meeting Ask can still hit it
-        // (logs/clare_s3_content_debug_20260831.log).  Recreate the session
-        // inline and retry once instead of flashing "Q&A unavailable".
-        // Note the recreated session has no meeting context — it is only a
-        // fallback; the normal post-meeting Ask stays on the original
-        // session because stop_meeting_impl neither sends {"type":"end"}
-        // nor closes the transcribe socket.
-        ui_status("Session expired - recreating");
-        if (clare_net_create_session(CONFIG_CLARE_TOPIC, s_session_id, sizeof(s_session_id)) == ESP_OK) {
-            s_host_recording = true;
-            s_host_session_rejected = false;
-            if (clare_net_host_connect(s_session_id) == ESP_OK) {
-                // Status is set by the HOST_CONNECTED event during connect;
-                // setting it again here logged "Ask Clare a question" twice.
-                start_audio_task(); clare_ui_set_host_active(true);
-                return;
-            }
-            s_host_recording = false;
-        }
-        ui_status("Clare Q&A unavailable");
+    start_audio_task();
+    clare_ui_set_host_busy(false);
+    clare_ui_set_host_active(true);
+    ui_status("正在听 / 停顿后自动发送");
+    ESP_LOGI(TAG, "Conversation: listening on same session");
+}
+
+static void start_conversation_impl()
+{
+    if (s_conversation_stop_requested) return;
+    if (!s_session_id[0] || s_session_ended) {
+        clare_ui_set_conversation_active(false);
+        ui_status("请先开始一场会议");
         return;
     }
-    start_audio_task(); clare_ui_set_host_active(true);
+    if (s_conversation_active) return;
+    s_conversation_active = true; // Keeps the meeting mic paused through all rounds.
+    s_host_cancelled = false;
+    s_host_failed = false;
+    s_host_recording = false;
+    s_round_inflight = false;
+    s_completion_queued = false;
+    s_auto_send_pending = false;
+    s_waiting_playback = false;
+    s_host_reconnect_attempts = 0;
+    s_next_host_connect = 0;
+    clare_ui_set_conversation_active(true);
+    clare_ui_set_host_busy(true);
+    clare_ui_set_answer("请直接说话，停顿后会自动发送。\n回答结束后，你可以继续提问。");
+    ui_status("正在连接 Clare…");
+}
+
+// Runs only in the action task. Do not record until both server done and local
+// playback drain have completed; the extra 400ms avoids capturing speaker echo.
+static void service_conversation()
+{
+    if (!s_conversation_active || s_conversation_stop_requested) return;
+    if (s_waiting_playback) {
+        if (clare_audio_mp3_is_active()) { s_echo_settle_since = 0; return; }
+        if (!s_echo_settle_since) { s_echo_settle_since = xTaskGetTickCount(); return; }
+        if (xTaskGetTickCount() - s_echo_settle_since < pdMS_TO_TICKS(400)) return;
+        s_waiting_playback = false;
+        s_echo_settle_since = 0;
+    }
+    if (s_round_inflight || s_host_recording) return;
+    if (!s_host_connected) {
+        if (s_host_reconnect_attempts >= 3) return;
+        if (s_next_host_connect && static_cast<int32_t>(xTaskGetTickCount() - s_next_host_connect) < 0) return;
+        ++s_host_reconnect_attempts;
+        s_host_session_rejected = false;
+        ui_status("正在连接 Clare…");
+        if (clare_net_host_connect(s_session_id) != ESP_OK) {
+            s_next_host_connect = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+            if (s_host_session_rejected) {
+                s_host_reconnect_attempts = 3;
+                ui_status("会议已失效，请停止交流后新建会议");
+            } else if (s_host_reconnect_attempts >= 3) {
+                ui_status("连接未恢复，请停止交流后重试");
+            }
+            return;
+        }
+        s_host_reconnect_attempts = 0;
+    }
+    begin_listening();
 }
 
 static void finish_host_impl(void *)
 {
+    if (s_conversation_active && !s_conversation_stop_requested) {
+        s_round_inflight = false;
+        s_host_answer_since = 0;
+        if (s_host_answer_timer) esp_timer_stop(s_host_answer_timer);
+        s_host_recording = false;
+        (void)clare_audio_mp3_finish_async();
+        s_waiting_playback = true;
+        s_echo_settle_since = 0;
+        clare_ui_set_host_active(false);
+        clare_ui_set_host_busy(true);
+        if (s_host_failed) {
+            // Timeout or server error: discard any stalled question state,
+            // but retain the same logical conversation and meeting session.
+            (void)clare_net_host_disconnect();
+            s_host_connected = false;
+        }
+        return;
+    }
+    if (s_conversation_stop_requested && !s_host_connected && !s_host_recording) return;
     // Single "answer flow ended" point: clear the waiting flag here too, not
     // only in the HOST_DONE event — the 60 s answer watchdog reaches this
     // function without any HOST_DONE, and a stale s_host_answer_since would
@@ -599,42 +698,97 @@ static void finish_host_impl(void *)
         // after host Q&A. Recreate it unconditionally so the next utterance
         // is attached to a fresh live recognition stream, rather than being
         // captured locally with no transcript events.
-        ui_status("Resuming live transcription...");
-        (void)clare_net_transcribe_disconnect();
+        ui_status("正在恢复会议录音…");
         s_transcribe_connected = false;
+        (void)clare_net_transcribe_disconnect();
         vTaskDelay(pdMS_TO_TICKS(100));
         if (clare_net_transcribe_connect(s_session_id) == ESP_OK) {
             s_transcribe_connected = true;
         } else {
-            ui_status("Transcription reconnect failed - retrying...");
+            ui_status("转写重连中，请稍候");
         }
     }
-    ui_status(s_meeting_active ? "Listening - live transcription" : "Answer ready");
+    clare_ui_set_host_busy(clare_audio_mp3_is_active());
+    if (s_host_failed) ui_status("回答失败，可以重新提问");
+    else if (s_host_cancelled) ui_status("已停止回答");
+    else ui_status(s_meeting_active ? "正在记录 / 实时转写" : "回答已完成");
 }
 
 static void refresh_summary_impl(void *)
 {
-    if (!s_session_id[0]) { ui_status("No meeting to summarize"); return; }
-    // Allocated from PSRAM on demand: internal RAM is scarce (WS task stacks
-    // need 10 KB contiguous) and the understanding JSON of a real meeting
-    // exceeds 2 KB (logs/clare_s3_e2e_test_20260829.log).
-    char *json = static_cast<char *>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM));
-    char *summary = static_cast<char *>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM));
-    if (!json || !summary) {
-        heap_caps_free(json);
-        heap_caps_free(summary);
-        ui_status("Summary unavailable - low memory");
-        return;
+    if (!s_session_id[0] || s_conversation_active || s_host_recording || s_host_connected || clare_audio_mp3_is_active()) return;
+    // Complete server snapshots include evidence and todos. Keep large payloads
+    // in PSRAM, reject truncation, and leave the last valid UI snapshot intact.
+    constexpr size_t capacity = 256 * 1024;
+    char *json = static_cast<char *>(heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM));
+    if (!json) { clare_ui_summary_error("内存不足，保留上次内容"); return; }
+    esp_err_t err = clare_net_get_understanding(s_session_id, json, capacity);
+    if (err != ESP_OK || !clare_ui_set_understanding(json)) {
+        clare_ui_summary_error(err == ESP_ERR_NO_MEM ? "会议内容过大，暂时保留上次内容" : "同步暂缓，保留上次内容");
     }
-    json[0] = '\0';
-    summary[0] = '\0';
-    if (clare_net_get_understanding(s_session_id, json, 4096) == ESP_OK &&
-        clare_net_format_understanding(json, summary, 4096) == ESP_OK) {
-        clare_ui_set_answer(summary); ui_status("Summary refreshed");
-    }
-    else ui_status("Summary not ready");
     heap_caps_free(json);
-    heap_caps_free(summary);
+}
+
+static void resume_meeting_impl()
+{
+    if (s_meeting_active || !s_session_id[0] || s_session_ended) return;
+    if (!clare_net_wifi_is_connected() && clare_net_wifi_connect(15000) != ESP_OK) {
+        ui_status("网络未连接，请稍后再试"); return;
+    }
+    if (!s_transcribe_connected && clare_net_transcribe_connect(s_session_id) != ESP_OK) {
+        ui_status("无法继续本场会议，请检查网络"); return;
+    }
+    s_meeting_active = true;
+    clare_ui_set_meeting_active(true);
+    start_audio_task();
+    ui_status("正在记录 / 实时转写");
+}
+
+static void stop_answer_impl()
+{
+    const bool had_conversation = s_conversation_active;
+    s_conversation_stop_requested = true;
+    s_auto_send_pending = false;
+    s_round_inflight = false;
+    s_completion_queued = true;
+    s_waiting_playback = false;
+    // Keep the meeting feed paused until the stale ASR channel is refreshed.
+    if (had_conversation) s_transcribe_connected = false;
+    s_conversation_active = false;
+    clare_ui_set_conversation_active(false);
+    s_host_cancelled = true;
+    s_host_recording = false;
+    s_host_answer_since = 0;
+    if (s_host_answer_timer) esp_timer_stop(s_host_answer_timer);
+    (void)clare_audio_mp3_abort();
+    if (s_host_connected) (void)clare_net_host_send_stop();
+    // The explicit stop owns teardown; stale done callbacks are ignored.
+    s_conversation_stop_requested = false;
+    finish_host_impl(nullptr);
+    s_conversation_stop_requested = true;
+    clare_ui_set_host_busy(false);
+    clare_ui_set_page(CLARE_UI_CLARE);
+    ui_status(s_meeting_active ? "交流已停止 / 正在记录" : "交流已停止");
+}
+
+static void end_meeting_impl()
+{
+    if (!s_session_id[0]) return;
+    if (s_meeting_active) stop_meeting_impl(nullptr);
+    // The UI keeps the snapshot readable, but disables Ask as soon as ending
+    // starts; a timed-out HTTP end may already have ended the server session.
+    s_session_ended = true;
+    clare_ui_set_session_ended(true);
+    clare_ui_set_action_busy(true);
+    (void)clare_net_transcribe_flush();
+    (void)clare_net_transcribe_disconnect();
+    s_transcribe_connected = false;
+    ui_status("正在整理最终纪要…");
+    bool complete = false;
+    esp_err_t err = clare_net_finalize_session(s_session_id, &complete);
+    refresh_summary_impl(nullptr);
+    ui_status(err == ESP_OK && complete ? "会议已结束 / 纪要已完成" : "会议已停止 / 纪要完整性未确认");
+    clare_ui_set_action_busy(false);
 }
 
 static void open_clare(void *) { clare_ui_set_page(CLARE_UI_CLARE); }
@@ -661,11 +815,11 @@ static void start_provisioning_impl(void *)
     }
     clare_ui_set_wifi("Wi-Fi: setup hotspot");
     clare_ui_set_page(CLARE_UI_WIFI_SETUP);
-    clare_ui_set_prov_status("Opening the setup hotspot...");
+    clare_ui_set_prov_status("正在开启配网热点…");
     esp_err_t err = clare_prov_start();
     if (err != ESP_OK) {
         clare_ui_set_wifi("Wi-Fi: hotspot failed");
-        clare_ui_set_prov_status("The hotspot failed to start. Go back and try again.");
+        clare_ui_set_prov_status("热点开启失败，请返回重试。");
     }
 }
 
@@ -817,14 +971,31 @@ static void boot_ask_e2e_test(void)
 static void action_task(void *)
 {
     Action action;
-    while (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdTRUE) {
+    while (true) {
+        service_conversation();
+        if (xQueueReceive(s_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+            clare_ui_set_host_busy(!s_host_recording && (s_host_connected || s_host_answer_since || clare_audio_mp3_is_active()));
+            continue;
+        }
         switch (action) {
-        case Action::StartMeeting: start_meeting_impl(nullptr); break;
-        case Action::StopMeeting: stop_meeting_impl(nullptr); break;
+        case Action::StartMeeting: start_meeting_impl(nullptr); clare_ui_set_session_available(s_session_id[0] != 0); clare_ui_set_meeting_active(s_meeting_active); clare_ui_set_action_busy(false); break;
+        case Action::StopMeeting: stop_meeting_impl(nullptr); clare_ui_set_action_busy(false); break;
+        case Action::ResumeMeeting: resume_meeting_impl(); clare_ui_set_action_busy(false); break;
+        case Action::EndMeeting: end_meeting_impl(); break;
+        case Action::StopAnswer: stop_answer_impl(); break;
         case Action::HandleMeetingDisconnect: handle_meeting_disconnect_impl(nullptr); break;
         case Action::HandleHostRejected: handle_host_rejected_impl(nullptr); break;
-        case Action::ToggleHost: toggle_host_impl(nullptr); break;
-        case Action::RefreshSummary: refresh_summary_impl(nullptr); break;
+        case Action::ToggleHost: start_conversation_impl(); break;
+        case Action::AutoSendHost:
+            if (s_auto_send_pending.exchange(false)) send_host_question();
+            break;
+        case Action::SpeechStarted:
+            if (s_conversation_active && s_host_recording && !s_conversation_stop_requested) {
+                if (!s_host_answer_text[0]) clare_ui_set_answer("正在听你的问题…");
+                ESP_LOGI(TAG, "Conversation: speech detected");
+            }
+            break;
+        case Action::RefreshSummary: refresh_summary_impl(nullptr); s_refresh_queued = false; break;
         case Action::FinishHost: finish_host_impl(nullptr); break;
         case Action::CleanupHost:
             // A CleanupHost queued by a failed/closed host connection must
@@ -840,6 +1011,12 @@ static void action_task(void *)
             // already false (pit 7), so gating loses nothing.
             if (!s_host_connected && !s_host_recording) {
                 (void)clare_net_host_disconnect();
+                if (s_conversation_active) {
+                    s_round_inflight = false;
+                    (void)clare_audio_mp3_finish_async();
+                    s_waiting_playback = true;
+                    s_echo_settle_since = 0;
+                }
             }
             break;
         case Action::StartProvisioning: start_provisioning_impl(nullptr); break;
@@ -870,14 +1047,26 @@ static void enqueue_action(Action action)
         // a flaky link; dropping duplicates is harmless (one recovery is
         // already queued/running) and must not flash a bogus UI status.
         if (action == Action::HandleMeetingDisconnect || action == Action::CleanupHost) return;
-        ui_status("Clare is still working...");
+        ui_status("正在处理，请稍候");
     }
 }
 
 static void start_meeting(void *) { enqueue_action(Action::StartMeeting); }
 static void stop_meeting(void *) { enqueue_action(Action::StopMeeting); }
-static void toggle_host(void *) { enqueue_action(Action::ToggleHost); }
-static void refresh_summary(void *) { enqueue_action(Action::RefreshSummary); }
+static void toggle_host(void *) { s_conversation_stop_requested = false; enqueue_action(Action::ToggleHost); }
+static void refresh_summary(void *) {
+    if (s_refresh_queued.exchange(true)) return;
+    Action action = Action::RefreshSummary;
+    if (!s_action_queue || xQueueSend(s_action_queue, &action, 0) != pdTRUE) s_refresh_queued = false;
+}
+static void resume_meeting(void *) { enqueue_action(Action::ResumeMeeting); }
+static void end_meeting(void *) { enqueue_action(Action::EndMeeting); }
+static void stop_answer(void *) {
+    // Immediate capture/callback gate; teardown itself stays out of LVGL.
+    s_conversation_stop_requested = true;
+    s_host_cancelled = true;
+    enqueue_action(Action::StopAnswer);
+}
 
 extern "C" void app_main(void)
 {
@@ -923,7 +1112,8 @@ extern "C" void app_main(void)
     clare_ui_callbacks_t callbacks = {
         .open_clare = open_clare, .close_clare = close_clare, .start_meeting = start_meeting,
         .stop_meeting = stop_meeting, .toggle_host = toggle_host, .refresh_summary = refresh_summary,
-        .open_wifi_setup = open_wifi_setup, .close_wifi_setup = close_wifi_setup, .ctx = nullptr,
+        .open_wifi_setup = open_wifi_setup, .close_wifi_setup = close_wifi_setup,
+        .resume_meeting = resume_meeting, .end_meeting = end_meeting, .stop_answer = stop_answer, .ctx = nullptr,
     };
     clare_ui_init(&callbacks);
     clare_net_config_t net_config = {.event_cb = net_event, .ctx = nullptr};
@@ -963,9 +1153,8 @@ extern "C" void app_main(void)
     enqueue_action(Action::BootNetworkSelfTest);
 #endif
     ESP_LOGI(TAG, "Clare UI ready; touch the Clare tile");
-    // Audible smoke test of the whole playback chain (codec -> amp -> speaker
-    // -> MP3 decoder).  One short chime per boot; if this is not heard, the
-    // speaker path is broken regardless of network state.
+    // Offline welcome: "Hi，议小豆已就绪。" Play once per boot, while retaining
+    // playback diagnostics in the log for codec/amp/speaker/MP3 verification.
     extern const uint8_t selftest_chime_mp3_start[] asm("_binary_selftest_chime_mp3_start");
     extern const uint8_t selftest_chime_mp3_end[] asm("_binary_selftest_chime_mp3_end");
     esp_err_t chime_err = clare_audio_play_mp3(selftest_chime_mp3_start,

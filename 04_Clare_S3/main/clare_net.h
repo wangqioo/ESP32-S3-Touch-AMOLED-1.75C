@@ -47,6 +47,8 @@ typedef enum {
     CLARE_NET_EVENT_PROV_CREDENTIALS_SAVED,
     CLARE_NET_EVENT_PROV_STOPPED,
     CLARE_NET_EVENT_ERROR,
+    // Full current question snapshot while the user is still recording.
+    CLARE_NET_EVENT_HOST_QUESTION_PARTIAL,
 } clare_net_event_type_t;
 
 typedef struct {
@@ -103,6 +105,7 @@ esp_err_t clare_net_create_session(const char *topic,
                                    char *out_session_id,
                                    size_t out_session_id_len);
 esp_err_t clare_net_end_session(const char *session_id);
+esp_err_t clare_net_finalize_session(const char *session_id, bool *complete);
 esp_err_t clare_net_get_understanding(const char *session_id,
                                       char *out_json,
                                       size_t out_json_len);
